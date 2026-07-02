@@ -327,16 +327,47 @@ def fetch_comprehensive_data(stock_no):
         latest_div_cash = info['d']
         latest_div_period = ""
 
+    # Yahoo Finance 在雲端伺服器需要完整 browser headers 才不會被擋
+    _YF_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://finance.yahoo.com/",
+        "Origin": "https://finance.yahoo.com",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    import gzip
     suffixes = [".TW", ".TWO"]
+    yf_endpoints = [
+        "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d",
+        "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d",
+        "https://query1.finance.yahoo.com/v7/finance/chart/{symbol}?range=1y&interval=1d",
+    ]
     res = None
     for suffix in suffixes:
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{stock_no}{suffix}?range=1y&interval=1d"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            res = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())["chart"]["result"][0]
+        if res:
             break
-        except:
-            continue
+        for endpoint_tpl in yf_endpoints:
+            try:
+                symbol = f"{stock_no}{suffix}"
+                url = endpoint_tpl.format(symbol=symbol)
+                req = urllib.request.Request(url, headers=_YF_HEADERS)
+                raw = urllib.request.urlopen(req, timeout=10).read()
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    pass
+                data = json.loads(raw.decode("utf-8"))
+                result_list = data.get("chart", {}).get("result") or []
+                if result_list:
+                    res = result_list[0]
+                    break
+            except Exception as e:
+                print(f"YF fetch error [{endpoint_tpl[:40]}] {suffix}: {e}")
+                continue
 
     if not res:
         return None
