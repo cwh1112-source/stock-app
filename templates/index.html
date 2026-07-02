@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="股票分析">
+<title>📊 台股分析</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f7fa; margin: 0; padding: 20px 16px 40px;
+    color: #111; font-size: 16px;
+  }
+  .search-wrap {
+    max-width: 580px; margin: 0 auto 20px;
+    display: flex; gap: 10px;
+  }
+  .search-wrap input {
+    flex: 1; padding: 14px 18px; border-radius: 14px;
+    border: 1.5px solid #dde1ea; font-size: 18px;
+    outline: none; background: white;
+    -webkit-appearance: none;
+  }
+  .search-wrap input:focus { border-color: #007AFF; }
+  .search-wrap button {
+    padding: 14px 22px; border-radius: 14px;
+    background: #007AFF; color: white;
+    border: none; font-size: 18px; font-weight: 700;
+    cursor: pointer; white-space: nowrap;
+  }
+  .search-wrap button:active { opacity: 0.8; }
+
+  .loading {
+    text-align: center; padding: 60px 20px;
+    font-size: 18px; color: #888; display: none;
+  }
+  .error-box {
+    max-width: 580px; margin: 0 auto;
+    background: #fff5f5; border: 1.5px solid #fed7d7;
+    border-radius: 16px; padding: 20px;
+    color: #9b2c2c; font-size: 17px; display: none;
+  }
+
+  /* ── 結果卡片 ── */
+  .card {
+    background: white; max-width: 580px;
+    margin: 0 auto; border-radius: 24px;
+    padding: 24px 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.08);
+    display: none;
+  }
+  .header { text-align: center; margin-bottom: 24px; }
+  .stock-title { font-size: 30px; font-weight: 800; color: #000; }
+  .live-price { font-size: 48px; font-weight: 900; color: #d9383a; margin: 10px 0 4px; }
+  .day-chg { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+  .decision-badge {
+    display: inline-block; padding: 9px 24px;
+    border-radius: 50px; font-weight: 800; font-size: 18px;
+    border: 1.5px solid;
+  }
+
+  .metrics-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 10px; margin: 22px 0;
+  }
+  .metric-box {
+    background: #f8f9fb; border-radius: 12px;
+    padding: 12px 4px; text-align: center;
+    border: 1.5px solid #edf0f4;
+  }
+  .metric-box.per { border-color: #f3d99d; background: #fffdf6; }
+  .metric-label { color: #5a6578; font-size: 12px; margin-bottom: 6px; font-weight: 700; }
+  .metric-value { font-weight: 900; color: #24936E; font-size: 17px; }
+  .metric-box.per .metric-value { color: #b08117; }
+
+  .banner {
+    background: #eefbf5; border: 1.5px dashed #24936E;
+    border-radius: 12px; padding: 16px;
+    font-size: 15px; font-weight: 700;
+    text-align: center; margin-bottom: 24px;
+    color: #1e5236; line-height: 1.6;
+  }
+  .status-badge {
+    display: inline-block; margin-top: 8px;
+    padding: 4px 14px; border-radius: 20px;
+    font-size: 13px; font-weight: 700;
+    background: #fff3cd; color: #856404;
+    border: 1px solid #ffc107;
+  }
+  .status-badge.confirmed { background: #d4edda; color: #155724; border-color: #28a745; }
+
+  .section-title {
+    font-size: 20px; font-weight: 800; color: #1a202c;
+    margin: 28px 0 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .section-title::before {
+    content: ''; display: inline-block;
+    width: 5px; height: 20px;
+    background: #1a202c; border-radius: 3px;
+  }
+
+  .check-item {
+    font-size: 16px; margin: 12px 0;
+    display: flex; align-items: flex-start;
+    flex-wrap: wrap; gap: 5px; color: #1a202c; line-height: 1.6;
+  }
+  .chip-info { font-size: 16px; margin: 8px 0; color: #1a202c; line-height: 1.6; }
+  .chip-warning { color: #d9383a; font-weight: 700; margin-top: 4px; font-size: 15px; }
+
+  .strategy-group {
+    border-left: 5px solid #007AFF;
+    padding-left: 14px; margin-bottom: 22px;
+  }
+  .strategy-title { font-size: 17px; font-weight: 800; margin-bottom: 10px; }
+  .strategy-item { font-size: 16px; margin: 8px 0; color: #2d3748; line-height: 1.6; }
+  .strategy-item.red { color: #d9383a; }
+  .strategy-item.blue { color: #2b6cb0; }
+  .strategy-item.green { color: #24936E; }
+
+  .risk-box {
+    border-radius: 14px; padding: 18px;
+    font-size: 15px; line-height: 1.8;
+    margin-top: 28px; border: 1.5px solid #fed7d7;
+    background: #fff5f5; color: #9b2c2c;
+  }
+  .risk-box.bull { background: #eefbf5; color: #1e5236; border-color: #c6ebd4; }
+  .risk-line { margin: 6px 0; }
+</style>
+</head>
+<body>
+
+<div class="search-wrap">
+  <input type="text" id="stockInput" placeholder="輸入股票代碼，例如 2330"
+    inputmode="numeric" maxlength="6"
+    onkeydown="if(event.key==='Enter') doSearch()">
+  <button onclick="doSearch()">查詢</button>
+</div>
+
+<div class="loading" id="loading">⏳ 資料抓取中，請稍候...</div>
+<div class="error-box" id="errorBox"></div>
+<div class="card" id="resultCard"></div>
+
+<script>
+function doSearch() {
+  const code = document.getElementById('stockInput').value.trim();
+  if (!code) return;
+
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('resultCard').style.display = 'none';
+
+  fetch(`/api/stock/${code}`)
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('loading').style.display = 'none';
+      if (d.error) {
+        document.getElementById('errorBox').textContent = d.error;
+        document.getElementById('errorBox').style.display = 'block';
+        return;
+      }
+      renderCard(d);
+    })
+    .catch(e => {
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('errorBox').textContent = '網路錯誤，請稍後再試。';
+      document.getElementById('errorBox').style.display = 'block';
+    });
+}
+
+function renderCard(d) {
+  const chgSign = d.day_chg >= 0 ? '▲' : '▼';
+  const chgColor = d.day_chg >= 0 ? '#d9383a' : '#24936E';
+  const s = d.strategy;
+
+  // ── 大盤籌碼 ──
+  let chipHtml = '';
+  if (d.futures_net !== null && d.futures_net !== undefined) {
+    const absNet = Math.abs(d.futures_net).toLocaleString();
+    const sign = d.futures_net < 0 ? '-' : '+';
+    const isWarning = Math.abs(d.futures_net) > 300000;
+    chipHtml = `
+      <div class="chip-info">👤 外資台指期淨部位：<b>${sign}${absNet} 口</b></div>
+      ${isWarning ? `<div class="chip-warning">（⚠️ 歷史巨額空單避險）</div>` : ''}
+      <div style="font-size:13px;color:#888;margin-top:4px;">（資料日期：${d.futures_date}，收盤後更新）</div>`;
+  } else {
+    chipHtml = `<div class="chip-info" style="color:#888;">資料暫缺，請稍後再試</div>`;
+  }
+
+  // ── 股利顯示 ──
+  let bannerHtml = '';
+  if (d.is_etf) {
+    bannerHtml = `ℹ️ ${d.stock_no} 為 ETF，配息請參考發行商官方公告。`;
+  } else {
+    bannerHtml = `🍼 股利分紅動態：每股配發現金 <b>${d.div_display}</b> 元 / 配股 ${d.stk_display}，本次殖利率達 <b>${d.yield_rate}%</b>！`;
+    if (d.div_period) {
+      bannerHtml += `<br><span style="font-size:13px;font-weight:normal;color:#5a6578;">（資料期間：${d.div_period}　殖利率為本次單一公告除以現價，非年化數字）</span>`;
+    }
+    if (!d.is_latest_confirmed) {
+      bannerHtml += `<br><div class="status-badge">⚠️ 董事會決議（尚未定案，金額可能調整）</div>`;
+    } else {
+      bannerHtml += `<br><div class="status-badge confirmed">✅ 股東會已定案</div>`;
+    }
+  }
+
+  // ── 策略區塊 ──
+  let strategyHtml = '';
+  if (s.type === 'overheat') {
+    strategyHtml = `
+      <div class="strategy-group" style="border-left-color:#b08117;">
+        <div class="strategy-title" style="color:#b08117;">⏸️ 過熱暫停進場</div>
+        <div class="strategy-item">已過熱，暫不提供進場區間，建議等待回測 20MA（<b>${s.ma20}</b> 元）附近再評估</div>
+        <div class="strategy-item red">▪ 參考停利：<b>${s.tp}</b> 元</div>
+        <div class="strategy-item blue">▪ 參考防守：<b>${s.ma20}</b> 元</div>
+      </div>`;
+  } else {
+    // 短線
+    let shortHtml = '';
+    if (s.short_entry_min !== undefined) {
+      shortHtml = `
+        <div class="strategy-item">▪ 短線佈局：<b>${s.short_entry_min} ~ ${s.short_entry_max}</b> 元</div>
+        <div class="strategy-item red">▪ 短線停利：<b>${s.short_tp}</b> 元</div>
+        <div class="strategy-item blue">▪ 短線停損：<b>${s.short_sl}</b> 元（現價-1.5xATR）</div>`;
+    } else {
+      shortHtml = `<div class="strategy-item">▪ 跌破 10MA（<b>${s.short_no_entry}</b> 元），暫勿盲目接刀</div>`;
+    }
+
+    // 波段
+    let swingHtml = '';
+    if (s.swing_entry_min !== undefined) {
+      swingHtml = `
+        <div class="strategy-item">▪ 波段佈局：<b>${s.swing_entry_min} ~ ${s.swing_entry_max}</b> 元</div>
+        <div class="strategy-item red">▪ 波段目標：<b>${s.swing_target}</b>（${s.swing_target_label}）</div>
+        <div class="strategy-item blue">▪ 防守：<b>${s.swing_sl}</b> 元（20MA-1.5xATR）</div>`;
+    } else if (s.swing_watch_ma60 !== undefined) {
+      swingHtml = `
+        <div class="strategy-item">▪ 波段佈局：生命線下方，以季線 <b>${s.swing_watch_ma60}</b> 為守</div>
+        <div class="strategy-item">💡 若跌破季線 ${s.swing_watch_ma60} 元，建議減碼或停損</div>
+        <div class="strategy-item">💡 若站回 20MA ${s.swing_watch_ma20} 元以上，可恢復正常持有</div>`;
+    } else {
+      swingHtml = `
+        <div class="strategy-item red">⚠️ 季線（${s.swing_ma60} 元）已跌破，原防守位失效</div>
+        <div class="strategy-item">▪ 下一防守參考：<b>${s.swing_sl_below}</b> 元（現價-1.5xATR）</div>
+        <div class="strategy-item">💡 若再跌破 ${s.swing_sl_below} 元，建議執行停損出場</div>
+        <div class="strategy-item">💡 若止跌站回 ${s.swing_ma60} 元（季線）且RSI回升至40以上，可重新評估</div>`;
+    }
+
+    // 續抱 / 強烈買進
+    let extraHtml = '';
+    if (s.add_trigger !== undefined) {
+      if (d.action_tag === 'strong_buy') {
+        extraHtml = `
+          <div class="strategy-item" style="margin-top:12px;">🟢 <b>強勢加碼操作建議：</b></div>
+          <div class="strategy-item">均線多頭排列 + 爆量(${d.v_ratio}倍)同步出現，趨勢動能強勁，可採分批進場策略</div>
+          <div class="strategy-item">加碼點：突破 <b>${s.add_trigger}</b> 元且持續爆量，可視為趨勢延續，分批加碼</div>
+          <div class="strategy-item">若爆量收黑K，需留意主力出貨疑慮，宜減碼觀察</div>
+          <div class="strategy-item">減碼點：跌破 <b>${s.reduce_trigger}</b> 元（20MA），代表多頭結構轉弱，建議減碼或停利</div>`;
+      } else {
+        extraHtml = `
+          <div class="strategy-item" style="margin-top:12px;">💡 <b>續抱操作建議：</b></div>
+          <div class="strategy-item">加碼點：突破 <b>${s.add_trigger}</b> 元（前高附近），且當日成交量 > <b>${s.vol_lots.toLocaleString()}</b> 張（過去20日均量1.5倍），可視為轉強訊號加碼</div>
+          <div class="strategy-item">減碼點：跌破 <b>${s.reduce_trigger}</b> 元（20MA），代表多頭結構轉弱，建議減碼或停利保護獲利</div>`;
+      }
+    }
+
+    strategyHtml = `
+      <div class="strategy-group" style="border-left-color:#007AFF;">
+        <div class="strategy-title" style="color:#007AFF;">【短線交易戰術】</div>
+        ${shortHtml}
+      </div>
+      <div class="strategy-group" style="border-left-color:#24936E;">
+        <div class="strategy-title" style="color:#24936E;">【波段交易戰術】</div>
+        ${swingHtml}
+        ${extraHtml}
+      </div>`;
+  }
+
+  // ── 風險提醒 ──
+  const isBull = d.action_tag === 'strong_buy' || d.action_tag === 'hold';
+  const riskHtml = d.risk_lines.map(l => `<div class="risk-line">${l}</div>`).join('');
+
+  // ── 量化標準檢核 ──
+  const chkMA = d.ma10 > d.ma20 && d.ma20 > d.ma60 && d.price > d.ma10;
+  const chkMA20 = d.price > d.ma20;
+  const chkRSI = d.rsi >= 40 && d.rsi <= 65;
+  const chkBias = Math.abs(d.bias_pct) <= 6;
+  const chkVol = d.v_ratio > 1.5;
+
+  document.getElementById('resultCard').innerHTML = `
+    <div class="header">
+      <div class="stock-title">📊 ${d.name}（${d.stock_no}）</div>
+      <div class="live-price">${d.price.toLocaleString(undefined,{minimumFractionDigits:1,maximumFractionDigits:1})} 元</div>
+      <div class="day-chg" style="color:${chgColor}">
+        昨收 ${d.prev_close.toFixed(1)} 元　${chgSign} ${Math.abs(d.day_chg).toFixed(1)} 元（${chgSign}${Math.abs(d.day_chg_pct).toFixed(1)}%）
+      </div>
+      <div class="decision-badge" style="background:${d.decision_color}18;color:${d.decision_color};border-color:${d.decision_color};">
+        決策建議：${d.decision_text}
+      </div>
+    </div>
+
+    <div class="metrics-grid">
+      <div class="metric-box"><div class="metric-label">💰 公告配息</div><div class="metric-value">${d.div_display} 元</div></div>
+      <div class="metric-box"><div class="metric-label">🍇 公告配股</div><div class="metric-value">${d.stk_display}</div></div>
+      <div class="metric-box"><div class="metric-label">📈 單次殖利率</div><div class="metric-value">${d.yield_rate} %</div></div>
+      <div class="metric-box per"><div class="metric-label">⏳ 本益比</div><div class="metric-value">${d.pe_display}</div></div>
+    </div>
+
+    <div class="banner">${bannerHtml}</div>
+
+    <div class="section-title">🌐 大盤籌碼面（即時抓取中）</div>
+    ${chipHtml}
+
+    <div class="section-title">🤠 高手決策核心檢核</div>
+    <div class="check-item">${chkMA20 ? '✅' : '❌'} 股價在均線之上：<b>${chkMA20 ? '已達成' : '未達成'}</b></div>
+    <div class="check-item">🧬 20MA生命線檢視：${d.price > d.ma20
+      ? `✅ <b style="color:#24936E">已站穩生命線</b><br><span style="font-size:14px;color:#5a6578;">（目前股價高於 20MA 均線 ${d.ma20} 元）</span>`
+      : `❌ <b style="color:#d9383a">已跌破生命線！</b><br><span style="font-size:14px;color:#5a6578;">（目前股價低於 20MA 均線 ${d.ma20} 元）</span>`}</div>
+    <div class="check-item">📊 乖離率動態檢視：${Math.abs(d.bias_pct) <= 10
+      ? `✅ <b style="color:#24936E">+${d.bias_pct}%</b>`
+      : `⚠️ <b style="color:#b08117">${d.bias_pct}%</b>`}
+      <br><span style="font-size:14px;color:#5a6578;">【基準：-10% ~ +10%】${Math.abs(d.bias_pct) <= 10 ? '（軌道內溫和偏多，結構健康）' : '（乖離過大，注意修正風險）'}</span></div>
+    <div class="check-item">🔮 RSI技術指標：<b>${d.rsi}</b>
+      <br><span style="font-size:14px;color:#5a6578;">【基準：30 ~ 70】${d.rsi >= 30 && d.rsi <= 70 ? '（區間內正常，無明顯超買超賣）' : d.rsi > 70 ? '（超買，留意回落）' : '（超賣，留意反彈）'}</span></div>
+
+    <div class="section-title">📋 量化標準檢核</div>
+    <div class="check-item">🎯 K線形態 | 現: <b>${d.pattern}</b></div>
+    <div class="check-item">${chkMA ? '✅' : '❌'} 均線多頭排列向上 | MA10: ${d.ma10} / MA20: ${d.ma20} / MA60: ${d.ma60}</div>
+    <div class="check-item">${chkMA20 ? '✅' : '❌'} 站穩生命線 20MA（${d.ma20} 元）</div>
+    <div class="check-item">${chkRSI ? '✅' : '❌'} RSI(40-65) | 現: ${d.rsi}</div>
+    <div class="check-item">${chkBias ? '✅' : '❌'} 乖離率&lt;=6% | 現: ${d.bias_pct}%</div>
+    <div class="check-item">${chkVol ? '✅' : '❌'} 爆量(&gt;1.5倍) | 現: ${d.v_ratio}倍</div>
+
+    <div class="section-title">⚡ 實戰操盤交易策略</div>
+    ${strategyHtml}
+
+    <div class="risk-box ${isBull ? 'bull' : ''}">
+      ⚠️ <b>【實戰風控建議】</b><br>
+      ${riskHtml}
+    </div>
+  `;
+
+  document.getElementById('resultCard').style.display = 'block';
+  document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth' });
+}
+</script>
+</body>
+</html>
