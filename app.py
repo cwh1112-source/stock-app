@@ -327,60 +327,47 @@ def fetch_comprehensive_data(stock_no):
         latest_div_cash = info['d']
         latest_div_period = ""
 
-    # Yahoo Finance 在雲端伺服器需要完整 browser headers 才不會被擋
-    _YF_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://finance.yahoo.com/",
-        "Origin": "https://finance.yahoo.com",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
+    # 使用 yfinance 套件抓取歷史資料（內建 cookie/session 管理，可繞過 429）
+    import yfinance as yf
+    import time
 
-    import gzip
-    suffixes = [".TW", ".TWO"]
-    yf_endpoints = [
-        "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d",
-        "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?range=1y&interval=1d",
-        "https://query1.finance.yahoo.com/v7/finance/chart/{symbol}?range=1y&interval=1d",
-    ]
     res = None
-    for suffix in suffixes:
-        if res:
-            break
-        for endpoint_tpl in yf_endpoints:
-            try:
-                symbol = f"{stock_no}{suffix}"
-                url = endpoint_tpl.format(symbol=symbol)
-                req = urllib.request.Request(url, headers=_YF_HEADERS)
-                raw = urllib.request.urlopen(req, timeout=10).read()
-                try:
-                    raw = gzip.decompress(raw)
-                except Exception:
-                    pass
-                data = json.loads(raw.decode("utf-8"))
-                result_list = data.get("chart", {}).get("result") or []
-                if result_list:
-                    res = result_list[0]
-                    break
-            except Exception as e:
-                print(f"YF fetch error [{endpoint_tpl[:40]}] {suffix}: {e}")
+    for suffix in [".TW", ".TWO"]:
+        try:
+            symbol = f"{stock_no}{suffix}"
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(period="1y", auto_adjust=True)
+            if hist.empty:
                 continue
+            # 轉換成跟原本相同的格式供後續計算使用
+            res = {
+                "hist": hist,
+                "symbol": symbol,
+                "meta_price": float(hist["Close"].iloc[-1]),
+            }
+            break
+        except Exception as e:
+            print(f"yfinance error [{suffix}]: {e}")
+            time.sleep(1)
+            continue
 
     if not res:
         return None
 
+    hist = res["hist"]
+    c = list(hist["Close"])
+    o_raw = list(hist["Open"])
+    h_raw = list(hist["High"])
+    l_raw = list(hist["Low"])
+    v_raw = list(hist["Volume"])
+
     try:
-        quote = res["indicators"]["quote"][0]
-        c = [float(x) for x in quote["close"] if x is not None]
-        o_raw = [float(x) for x in quote.get("open", []) if x is not None]
-        h_raw = [float(x) for x in quote.get("high", []) if x is not None]
-        l_raw = [float(x) for x in quote.get("low", []) if x is not None]
-        v_raw = [float(x) for x in quote.get("volume", []) if x is not None]
-        m = res.get("meta", {})
-        price = float(m.get("regularMarketPrice", c[-1]))
+        c = [float(x) for x in c if x is not None]
+        o_raw = [float(x) for x in o_raw if x is not None]
+        h_raw = [float(x) for x in h_raw if x is not None]
+        l_raw = [float(x) for x in l_raw if x is not None]
+        v_raw = [float(x) for x in v_raw if x is not None]
+        price = float(c[-1])
 
         ma10 = sum(c[-10:]) / 10
         ma20 = sum(c[-20:]) / 20
