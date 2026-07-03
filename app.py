@@ -2,73 +2,136 @@ import json
 import urllib.request
 import ssl
 import time
-import csv
-import io
-from flask import Flask, render_template, jsonify, request
+import datetime
+from flask import Flask, render_template, jsonify
 
 app = Flask(__name__)
 
-# ==========================================
-# SSL context for Taiwan official sites
-# ==========================================
-_UNVERIFIED_SSL_CONTEXT = ssl.create_default_context()
-_UNVERIFIED_SSL_CONTEXT.check_hostname = False
-_UNVERIFIED_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+# ── SSL（台灣官方網站用）──
+_SSL = ssl.create_default_context()
+_SSL.check_hostname = False
+_SSL.verify_mode = ssl.CERT_NONE
 
-def _urlopen_relaxed(req, timeout=10):
-    return urllib.request.urlopen(req, timeout=timeout, context=_UNVERIFIED_SSL_CONTEXT)
+def _get(url, timeout=12):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.twse.com.tw/",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
+        return r.read().decode("utf-8", errors="replace")
 
-# ==========================================
-# TTL Cache
-# ==========================================
-CACHE_TTL_SECONDS = 6 * 60 * 60
+# ── 簡易 TTL 快取 ──
+class _Cache:
+    def __init__(self, ttl=3600):
+        self._ttl = ttl
+        self._d = {}
+    def get(self, k):
+        v = self._d.get(k)
+        if v and time.time() - v[1] < self._ttl:
+            return v[0]
+        return None
+    def set(self, k, v):
+        self._d[k] = (v, time.time())
 
-class _TTLCache:
-    def __init__(self, ttl_seconds=CACHE_TTL_SECONDS):
-        self._ttl = ttl_seconds
-        self._store = {}
+_cache = _Cache(ttl=3600)
 
-    def get(self, key):
-        item = self._store.get(key)
-        if item is None:
-            return None
-        value, fetched_at = item
-        if time.time() - fetched_at > self._ttl:
-            del self._store[key]
-            return None
-        return value
+# ════════════════════════════════════════
+# 1. 抓歷史日線（TWSE / TPEx 官方 API）
+#    回傳最近 N 個月的 {date, close, high, low, volume} list
+# ════════════════════════════════════════
+def _fetch_twse_history(stock_no, months=7):
+    """上市股票：TWSE afterTrading/STOCK_DAY"""
+    rows = []
+    today = datetime.date.today()
+    for i in range(months):
+        d = today.replace(day=1) - datetime.timedelta(days=i*28)
+        ym = d.strftime("%Y%m01")
+        try:
+            url = f"https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY?stockNo={stock_no}&date={ym}&response=json"
+            data = json.loads(_get(url))
+            if data.get("stat") != "OK":
+                continue
+            for row in data.get("data", []):
+                # row: [日期, 成交股數, 成交金額, 開盤價, 最高價, 最低價, 收盤價, 漲跌價差, 成交筆數]
+                try:
+                    rows.append({
+                        "close": float(row[6].replace(",", "")),
+                        "high":  float(row[4].replace(",", "")),
+                        "low":   float(row[5].replace(",", "")),
+                        "open":  float(row[3].replace(",", "")),
+                        "vol":   float(row[1].replace(",", "")),
+                    })
+                except:
+                    continue
+        except Exception as e:
+            print(f"TWSE history error {ym}: {e}")
+    return rows  # 舊→新順序
 
-    def set(self, key, value):
-        self._store[key] = (value, time.time())
+def _fetch_tpex_history(stock_no, months=7):
+    """上櫃股票：TPEx aftertrading/daily_close_quotes"""
+    rows = []
+    today = datetime.date.today()
+    for i in range(months):
+        d = today.replace(day=1) - datetime.timedelta(days=i*28)
+        # TPEx 用民國年
+        roc_year = d.year - 1911
+        ym = f"{roc_year}/{d.month:02d}"
+        try:
+            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d={ym}&stkno={stock_no}&o=json"
+            data = json.loads(_get(url))
+            for row in data.get("aaData", []):
+                # row: [日期, 收盤, 漲跌, 開盤, 最高, 最低, 成交量(張), ...]
+                try:
+                    rows.append({
+                        "close": float(str(row[2]).replace(",", "")),
+                        "high":  float(str(row[5]).replace(",", "")),
+                        "low":   float(str(row[6]).replace(",", "")),
+                        "open":  float(str(row[3]).replace(",", "")),
+                        "vol":   float(str(row[7]).replace(",", "")) * 1000,
+                    })
+                except:
+                    continue
+        except Exception as e:
+            print(f"TPEx history error {ym}: {e}")
+    return rows
 
-_cache = _TTLCache()
+def _fetch_realtime_price(stock_no):
+    """即時現價：TWSE mis API"""
+    # 先試上市
+    for ex, prefix in [("tse", "tse"), ("otc", "otc")]:
+        try:
+            url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={prefix}_{stock_no}.tw&json=1&delay=0"
+            data = json.loads(_get(url, timeout=8))
+            items = data.get("msgArray", [])
+            if items:
+                p = items[0].get("z") or items[0].get("y")  # z=即時, y=昨收(收盤後)
+                if p and p != "-":
+                    return float(p), items[0].get("y", p)
+        except Exception as e:
+            print(f"realtime price error {prefix}: {e}")
+    return None, None
 
-# ==========================================
-# ETF 判斷
-# ==========================================
-def is_etf_code(stock_no):
-    try:
-        n = int(stock_no)
-        return 00000 <= n <= 9999 and len(stock_no) == 6 and stock_no.startswith('0')
-    except:
-        return len(stock_no) == 6 and stock_no.startswith('0')
+# ════════════════════════════════════════
+# 2. ETF 判斷
+# ════════════════════════════════════════
+def is_etf(stock_no):
+    return len(stock_no) == 6 and stock_no.startswith("0")
 
-# ==========================================
-# 抓取中文公司名稱
-# ==========================================
-def fetch_cn_name(stock_no, debug=False):
+# ════════════════════════════════════════
+# 3. 公司名稱
+# ════════════════════════════════════════
+def fetch_name(stock_no):
     cached = _cache.get(f"name_{stock_no}")
     if cached:
         return cached
-    urls = [
-        f"https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-        f"https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
-    ]
-    for url in urls:
+    for url in [
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+        "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
+    ]:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with _urlopen_relaxed(req, timeout=8) as r:
-                data = json.loads(r.read().decode('utf-8'))
+            data = json.loads(_get(url))
             for item in data:
                 code = str(item.get("公司代號", item.get("SecuritiesCompanyCode", ""))).strip()
                 if code == str(stock_no).strip():
@@ -76,48 +139,37 @@ def fetch_cn_name(stock_no, debug=False):
                     if name:
                         _cache.set(f"name_{stock_no}", name)
                         return name
-        except Exception as e:
-            if debug:
-                print(f"name fetch error: {e}")
+        except:
             continue
-    return None
+    return f"股票{stock_no}"
 
-# ==========================================
-# 抓取本益比
-# ==========================================
-def fetch_pe(stock_no, debug=False):
+# ════════════════════════════════════════
+# 4. 本益比
+# ════════════════════════════════════════
+def fetch_pe(stock_no):
     cached = _cache.get(f"pe_{stock_no}")
     if cached is not None:
         return cached
-
-    # 上市 TWSE
+    # 上市
     try:
         url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?response=json"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with _urlopen_relaxed(req, timeout=10) as r:
-            data = json.loads(r.read().decode('utf-8'))
-        rows = data.get("data", [])
-        for row in rows:
+        data = json.loads(_get(url))
+        for row in data.get("data", []):
             if row and str(row[0]).strip() == str(stock_no).strip():
-                pe_val = str(row[4]).strip()
-                if pe_val and pe_val not in ("-", "--", ""):
-                    val = round(float(pe_val.replace(",", "")), 2)
+                pe_val = str(row[4]).replace(",", "").strip()
+                if pe_val and pe_val not in ("-", "--"):
+                    val = round(float(pe_val), 2)
                     _cache.set(f"pe_{stock_no}", val)
                     return val
     except Exception as e:
-        if debug:
-            print(f"TWSE PE error: {e}")
-
-    # 上櫃 TPEx
-    tpex_pe_urls = [
+        print(f"PE TWSE error: {e}")
+    # 上櫃
+    for pe_url in [
         "https://www.tpex.org.tw/web/stock/aftertrading/peratio_listed/peListed_result.php?l=zh-tw&o=json",
         "https://www.tpex.org.tw/openapi/v1/tpex_peratio_listed",
-    ]
-    for pe_url in tpex_pe_urls:
+    ]:
         try:
-            req = urllib.request.Request(pe_url, headers={"User-Agent": "Mozilla/5.0"})
-            with _urlopen_relaxed(req, timeout=10) as r:
-                raw = r.read().decode('utf-8')
+            raw = _get(pe_url)
             if not raw.strip():
                 continue
             data = json.loads(raw)
@@ -125,466 +177,260 @@ def fetch_pe(stock_no, debug=False):
             for row in rows:
                 if isinstance(row, dict):
                     if str(row.get("SecuritiesCompanyCode", "")).strip() == str(stock_no).strip():
-                        pe_val = str(row.get("PriceEarningRatio", "")).strip()
-                        if pe_val and pe_val not in ("-", "--", ""):
-                            val = round(float(pe_val.replace(",", "")), 2)
+                        pe_val = str(row.get("PriceEarningRatio", "")).replace(",", "").strip()
+                        if pe_val and pe_val not in ("-", "--"):
+                            val = round(float(pe_val), 2)
                             _cache.set(f"pe_{stock_no}", val)
                             return val
                 elif row and str(row[0]).strip() == str(stock_no).strip():
-                    pe_val = str(row[4]).strip()
-                    if pe_val and pe_val not in ("-", "--", ""):
-                        val = round(float(pe_val.replace(",", "")), 2)
+                    pe_val = str(row[4]).replace(",", "").strip()
+                    if pe_val and pe_val not in ("-", "--"):
+                        val = round(float(pe_val), 2)
                         _cache.set(f"pe_{stock_no}", val)
                         return val
             break
         except Exception as e:
-            if debug:
-                print(f"TPEx PE error: {e}")
-            continue
+            print(f"PE TPEx error: {e}")
     return None
 
-# ==========================================
-# 抓取股利資料
-# ==========================================
-def fetch_dividend_info(stock_no, debug=False):
+# ════════════════════════════════════════
+# 5. 股利
+# ════════════════════════════════════════
+def fetch_dividend(stock_no):
     cached = _cache.get(f"div_{stock_no}")
     if cached is not None:
         return cached
-
-    market = "tpex" if len(stock_no) == 4 and stock_no.startswith("8") else "twse"
-
-    candidate_urls = {
-        "twse": ["https://openapi.twse.com.tw/v1/opendata/t187ap45_L"],
-        "tpex": [
-            "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dividend",
-            "https://www.tpex.org.tw/openapi/v1/tpex_dividend_announcement",
-            "https://www.tpex.org.tw/openapi/v1/tpex_dividend",
-            "https://openapi.twse.com.tw/v1/opendata/t187ap45_O",
-        ],
-    }
-    urls = candidate_urls.get(market, [])
-
+    is_tpex = len(stock_no) == 4 and (stock_no.startswith("8") or stock_no.startswith("9"))
+    urls = (
+        ["https://www.tpex.org.tw/openapi/v1/tpex_mainboard_dividend",
+         "https://www.tpex.org.tw/openapi/v1/tpex_dividend_announcement",
+         "https://openapi.twse.com.tw/v1/opendata/t187ap45_O"]
+        if is_tpex else
+        ["https://openapi.twse.com.tw/v1/opendata/t187ap45_L"]
+    )
     for url in urls:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with _urlopen_relaxed(req, timeout=10) as r:
-                raw = r.read().decode('utf-8')
-            if not raw.strip():
-                continue
-            data = json.loads(raw)
-            if not isinstance(data, list):
-                continue
-
-            matched = [item for item in data if str(item.get("公司代號", item.get("SecuritiesCompanyCode", ""))).strip() == str(stock_no).strip()]
+            data = json.loads(_get(url))
+            matched = [x for x in data if str(x.get("公司代號", x.get("SecuritiesCompanyCode",""))).strip() == str(stock_no).strip()]
             if not matched:
                 continue
-
-            total_cash = 0.0
-            total_stock = 0.0
-            periods = []
-            statuses = []
-            confirmed_cash = None
-            confirmed_period = None
-
-            for item in matched:
-                cash_val = item.get("現金股利", item.get("CashDividend", "0"))
-                stock_val = item.get("股票股利", item.get("StockDividend", "0"))
-                period = item.get("資料年度", item.get("Year", ""))
-                status = item.get("資料來源", item.get("DataSource", ""))
-                try:
-                    total_cash += float(str(cash_val).replace(",", "") or 0)
-                    total_stock += float(str(stock_val).replace(",", "") or 0)
-                    if period:
-                        periods.append(str(period))
-                    if status:
-                        statuses.append(str(status))
-                    if status and "董事會" not in status and float(str(cash_val).replace(",", "") or 0) > 0:
-                        if confirmed_cash is None:
-                            confirmed_cash = float(str(cash_val).replace(",", "") or 0)
-                            confirmed_period = str(period)
-                except:
-                    continue
-
-            latest_cash = None
-            latest_period = ""
-            is_latest_confirmed = False
-            if matched:
-                first = matched[0]
-                try:
-                    latest_cash = float(str(first.get("現金股利", first.get("CashDividend", "0"))).replace(",", "") or 0)
-                    latest_period = str(first.get("資料年度", first.get("Year", "")))
-                    first_status = str(first.get("資料來源", first.get("DataSource", "")))
-                    is_latest_confirmed = "董事會" not in first_status
-                except:
-                    pass
-
-            result = {
-                "cash": total_cash,
-                "stock": total_stock,
-                "period": "~".join(sorted(set(periods))),
-                "status": " / ".join(sorted(set(statuses))),
-                "confirmed_cash": confirmed_cash,
-                "confirmed_period": confirmed_period,
-                "is_latest_confirmed": is_latest_confirmed,
-                "latest_cash": latest_cash,
-                "latest_period": latest_period,
-            }
+            first = matched[0]
+            cash = float(str(first.get("現金股利", first.get("CashDividend","0"))).replace(",","") or 0)
+            stk  = float(str(first.get("股票股利", first.get("StockDividend","0"))).replace(",","") or 0)
+            period = str(first.get("資料年度", first.get("Year","")))
+            status = str(first.get("資料來源", first.get("DataSource","")))
+            result = {"cash": cash, "stk": stk, "period": period, "status": status,
+                      "confirmed": "董事會" not in status}
             _cache.set(f"div_{stock_no}", result)
             return result
         except Exception as e:
-            if debug:
-                print(f"Dividend fetch error [{url}]: {e}")
-            continue
+            print(f"dividend error: {e}")
     return None
 
-# ==========================================
-# 抓取外資台指期淨部位
-# ==========================================
-def fetch_foreign_futures_net_position(debug=False):
-    cached = _cache.get("futures_net")
-    if cached is not None:
+# ════════════════════════════════════════
+# 6. 外資台指期淨部位
+# ════════════════════════════════════════
+def fetch_futures():
+    cached = _cache.get("futures")
+    if cached:
         return cached
-
-    candidate_urls = [
+    for url in [
         "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersGeneralBytheDate",
         "https://openapi.taifex.com.tw/v1/MarketDataOfMajorInstitutionalTradersBytheDate",
-    ]
-    for url in candidate_urls:
+    ]:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with _urlopen_relaxed(req, timeout=10) as r:
-                raw = r.read().decode('utf-8')
-            if not raw.strip():
-                continue
-            data = json.loads(raw)
+            data = json.loads(_get(url))
             if not isinstance(data, list) or not data:
                 continue
             latest = data[-1]
             date_str = str(latest.get("Date", latest.get("date", "")))
-            net_val = None
-            for key in ["ForeignDealersNetOI", "Foreign_Net_OI", "foreignNetOI", "外資淨未平倉"]:
+            for key in ["ForeignDealersNetOI","Foreign_Net_OI","foreignNetOI","外資淨未平倉"]:
                 if key in latest:
-                    try:
-                        net_val = int(str(latest[key]).replace(",", ""))
-                        break
-                    except:
-                        continue
-            if net_val is not None:
-                result = (net_val, date_str)
-                _cache.set("futures_net", result)
-                return result
+                    net = int(str(latest[key]).replace(",",""))
+                    result = (net, date_str)
+                    _cache.set("futures", result)
+                    return result
         except Exception as e:
-            if debug:
-                print(f"Futures error [{url}]: {e}")
-            continue
+            print(f"futures error: {e}")
     return None, ""
 
-# ==========================================
-# 主要資料抓取
-# ==========================================
-def fetch_comprehensive_data(stock_no):
-    db = {
-        "2330": {"n": "台積電", "d": 16.0, "stk": 0.0, "e": 40.0},
-        "3037": {"n": "欣興",   "d": 3.0,  "stk": 0.0, "e": 8.5},
-        "2464": {"n": "盟立",   "d": 0.0,  "stk": 0.0, "e": 1.5},
-        "6139": {"n": "亞翔",   "d": 23.0, "stk": 0.0, "e": 32.5},
-        "6770": {"n": "力積電", "d": 0.0,  "stk": 0.0, "e": -0.5},
-        "6446": {"n": "藥華藥", "d": 1.5,  "stk": 1.1, "e": 15.0},
-        "2308": {"n": "台達電", "d": 6.43, "stk": 0.0, "e": 14.2},
-        "3481": {"n": "群創",   "d": 0.0,  "stk": 0.0, "e": -0.6},
-        "8027": {"n": "鈦昇",   "d": 0.0,  "stk": 0.0, "e": 1.2},
-        "8064": {"n": "東捷",   "d": 0.0,  "stk": 0.0, "e": 0.8},
-    }
-    info = db.get(stock_no, {"n": f"股票{stock_no}", "d": 0.0, "stk": 0.0, "e": 1.0})
+# ════════════════════════════════════════
+# 7. 主資料整合
+# ════════════════════════════════════════
+def fetch_stock(stock_no):
+    # 歷史日線（先試上市，失敗試上櫃）
+    rows = _fetch_twse_history(stock_no)
+    market = "twse"
+    if len(rows) < 20:
+        rows = _fetch_tpex_history(stock_no)
+        market = "tpex"
+    if len(rows) < 20:
+        return None
 
-    real_name = fetch_cn_name(stock_no)
-    if real_name:
-        info['n'] = real_name
+    c    = [r["close"] for r in rows]
+    h_r  = [r["high"]  for r in rows]
+    l_r  = [r["low"]   for r in rows]
+    o_r  = [r["open"]  for r in rows]
+    v_r  = [r["vol"]   for r in rows]
 
-    real_pe = fetch_pe(stock_no)
+    # 即時現價
+    live_price, prev_close_raw = _fetch_realtime_price(stock_no)
+    price      = live_price if live_price else c[-1]
+    prev_close = float(prev_close_raw) if prev_close_raw else c[-2] if len(c) >= 2 else price
 
-    dividend_period = ""
-    dividend_status = ""
-    confirmed_cash = None
-    confirmed_period = None
-    is_latest_confirmed = False
-    latest_div_cash = None
-    latest_div_period = ""
-    real_div = fetch_dividend_info(stock_no)
-    if real_div:
-        div_amount = real_div["cash"]
-        stk_amount = real_div["stock"]
-        dividend_period = real_div["period"]
-        dividend_status = real_div.get("status", "")
-        confirmed_cash = real_div.get("confirmed_cash")
-        confirmed_period = real_div.get("confirmed_period")
-        is_latest_confirmed = real_div.get("is_latest_confirmed", False)
-        latest_div_cash = real_div.get("latest_cash", real_div["cash"])
-        latest_div_period = real_div.get("latest_period", real_div["period"])
+    # 技術指標
+    ma10  = sum(c[-10:]) / 10
+    ma20  = sum(c[-20:]) / 20
+    ma60  = sum(c[-60:]) / 60 if len(c) >= 60 else sum(c) / len(c)
+    bias  = (price - ma20) / ma20 * 100
+
+    diff  = [c[i]-c[i-1] for i in range(1, len(c))]
+    gain  = sum(x for x in diff[-14:] if x > 0) / 14
+    loss  = abs(sum(x for x in diff[-14:] if x < 0)) / 14
+    rsi   = 100 - (100 / (1 + gain / (loss or 1)))
+
+    avg_vol = sum(v_r[-21:-1]) / 20 if len(v_r) >= 21 else (sum(v_r) / len(v_r) if v_r else 1)
+    v_ratio = v_r[-1] / avg_vol if avg_vol else 1.0
+
+    tr  = [max(h_r[i]-l_r[i], abs(h_r[i]-c[i-1]), abs(l_r[i]-c[i-1])) for i in range(1, len(c))]
+    atr = sum(tr[-14:]) / 14 if len(tr) >= 14 else price * 0.03
+
+    high_60d = max(h_r[-60:]) if len(h_r) >= 60 else max(h_r)
+    avg_vol_20d = avg_vol
+
+    last_open = o_r[-1] if o_r else price
+    if price > last_open and price > ma20 and v_ratio > 1.2:
+        pattern = "🎯 強勢紅K突破"
+    elif price > last_open:
+        pattern = "📈 紅K攻擊"
+    elif price <= last_open and price > ma20:
+        pattern = "⚠️ 多頭回檔"
     else:
-        div_amount = info['d']
-        stk_amount = info['stk']
-        latest_div_cash = info['d']
-        latest_div_period = ""
+        pattern = "📉 弱勢盤整"
 
-    # 使用 yfinance 套件抓取歷史資料（內建 cookie/session 管理，可繞過 429）
-    import yfinance as yf
-    import time
+    name    = fetch_name(stock_no)
+    pe      = fetch_pe(stock_no)
+    div     = fetch_dividend(stock_no)
+    fut_net, fut_date = fetch_futures()
 
-    res = None
-    for suffix in [".TW", ".TWO"]:
-        try:
-            symbol = f"{stock_no}{suffix}"
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period="1y", auto_adjust=True)
-            if hist.empty:
-                continue
-            # 轉換成跟原本相同的格式供後續計算使用
-            res = {
-                "hist": hist,
-                "symbol": symbol,
-                "meta_price": float(hist["Close"].iloc[-1]),
-            }
-            break
-        except Exception as e:
-            print(f"yfinance error [{suffix}]: {e}")
-            time.sleep(1)
-            continue
+    return {
+        "name": name, "price": price, "prev_close": prev_close,
+        "ma10": ma10, "ma20": ma20, "ma60": ma60,
+        "bias": bias, "rsi": rsi, "v_ratio": v_ratio,
+        "avg_vol_20d": avg_vol_20d, "atr": atr,
+        "high_60d": high_60d, "pattern": pattern,
+        "pe": pe or 0,
+        "div_cash": div["cash"] if div else 0,
+        "div_stk":  div["stk"]  if div else 0,
+        "div_period": div["period"] if div else "",
+        "div_confirmed": div["confirmed"] if div else False,
+        "futures_net": fut_net,
+        "futures_date": fut_date,
+        "is_etf": is_etf(stock_no),
+    }
 
-    if not res:
-        return None
-
-    hist = res["hist"]
-    c = list(hist["Close"])
-    o_raw = list(hist["Open"])
-    h_raw = list(hist["High"])
-    l_raw = list(hist["Low"])
-    v_raw = list(hist["Volume"])
-
-    try:
-        c = [float(x) for x in c if x is not None]
-        o_raw = [float(x) for x in o_raw if x is not None]
-        h_raw = [float(x) for x in h_raw if x is not None]
-        l_raw = [float(x) for x in l_raw if x is not None]
-        v_raw = [float(x) for x in v_raw if x is not None]
-        price = float(c[-1])
-
-        ma10 = sum(c[-10:]) / 10
-        ma20 = sum(c[-20:]) / 20
-        ma60 = sum(c[-60:]) / 60
-        ma120 = sum(c[-120:]) / 120 if len(c) >= 120 else sum(c) / len(c)
-        bias = ((price - ma20) / ma20) * 100
-
-        diff = [c[i] - c[i-1] for i in range(1, len(c))]
-        gain = sum(d for d in diff[-14:] if d > 0) / 14
-        loss = abs(sum(d for d in diff[-14:] if d < 0)) / 14
-        rsi = 100 - (100 / (1 + (gain / (loss if loss != 0 else 1))))
-
-        prev_close = c[-2] if len(c) >= 2 else price
-
-        if len(v_raw) >= 21:
-            avg_vol_20d = sum(v_raw[-21:-1]) / 20
-            v_ratio = (v_raw[-1] / avg_vol_20d) if avg_vol_20d > 0 else 1.0
-        else:
-            avg_vol_20d = sum(v_raw) / len(v_raw) if v_raw else 0
-            v_ratio = 1.0
-
-        if len(h_raw) >= 15 and len(l_raw) >= 15 and len(c) >= 15:
-            tr = [max(h_raw[i]-l_raw[i], abs(h_raw[i]-c[i-1]), abs(l_raw[i]-c[i-1])) for i in range(1, len(c))]
-            atr = sum(tr[-14:]) / 14
-        else:
-            atr = price * 0.03
-
-        high_60d = max(h_raw[-60:]) if len(h_raw) >= 60 else (max(h_raw) if h_raw else price)
-
-        last_open = o_raw[-1] if o_raw else price
-        if price > last_open and price > ma20 and v_ratio > 1.2:
-            pattern = "🎯 強勢紅K突破"
-        elif price > last_open:
-            pattern = "📈 紅K攻擊"
-        elif price <= last_open and price > ma20:
-            pattern = "⚠️ 多頭回檔"
-        else:
-            pattern = "📉 弱勢盤整"
-
-        futures_net, futures_date = fetch_foreign_futures_net_position()
-
-        return {
-            "name": info['n'],
-            "price": price,
-            "prev_close": prev_close,
-            "ma10": ma10, "ma20": ma20, "ma60": ma60, "ma120": ma120,
-            "bias": bias, "rsi": rsi,
-            "v_ratio": v_ratio, "avg_vol_20d": avg_vol_20d,
-            "atr": atr, "high_60d": high_60d, "pattern": pattern,
-            "div": div_amount, "stk": stk_amount,
-            "div_period": dividend_period, "div_status": dividend_status,
-            "confirmed_cash": confirmed_cash, "confirmed_period": confirmed_period,
-            "is_latest_confirmed": is_latest_confirmed,
-            "latest_div_cash": latest_div_cash, "latest_div_period": latest_div_period,
-            "pe": real_pe if real_pe is not None else (price / info['e'] if info['e'] > 0 else 0),
-            "futures_net": futures_net,
-            "futures_date": futures_date,
-        }
-    except Exception as e:
-        print(f"數據解析錯誤: {e}")
-        return None
-
-# ==========================================
+# ════════════════════════════════════════
 # Flask 路由
-# ==========================================
+# ════════════════════════════════════════
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/api/stock/<stock_no>")
 def get_stock(stock_no):
-    stock_no = stock_no.strip().upper()
-    d = fetch_comprehensive_data(stock_no)
+    stock_no = stock_no.strip()
+    d = fetch_stock(stock_no)
     if not d:
-        return jsonify({"error": f"查無股票代碼 {stock_no}"}), 404
+        return jsonify({"error": f"查無股票代碼 {stock_no}，請確認代碼是否正確"}), 404
 
-    # 五級決策邏輯
-    price = d['price']
-    ma10, ma20, ma60 = d['ma10'], d['ma20'], d['ma60']
-    bias_pct = d['bias']
-    rsi = d['rsi']
-    v_ratio = d['v_ratio']
-    atr = d['atr']
-    high_60d = d['high_60d']
-    avg_vol_20d = d['avg_vol_20d']
+    price  = d["price"]
+    ma10, ma20, ma60 = d["ma10"], d["ma20"], d["ma60"]
+    bias_pct = d["bias"]
+    rsi, v_ratio = d["rsi"], d["v_ratio"]
+    atr, high_60d, avg_vol_20d = d["atr"], d["high_60d"], d["avg_vol_20d"]
 
+    # 五級決策
     if price > ma20:
         if bias_pct > 6 or rsi > 70:
-            action_tag = "overheat"
-            decision_text = "過熱觀察，暫勿追高"
-            decision_color = "#b08117"
+            action_tag, decision_text, decision_color = "overheat", "過熱觀察，暫勿追高", "#b08117"
         elif v_ratio > 1.5 and ma10 > ma20 > ma60:
-            action_tag = "strong_buy"
-            decision_text = "強烈買進/加碼"
-            decision_color = "#24936E"
+            action_tag, decision_text, decision_color = "strong_buy", "強烈買進/加碼", "#24936E"
         else:
-            action_tag = "hold"
-            decision_text = "續抱"
-            decision_color = "#007AFF"
+            action_tag, decision_text, decision_color = "hold", "續抱", "#007AFF"
     elif price > ma60 and rsi >= 40:
-        action_tag = "watch"
-        decision_text = "觀察整理"
-        decision_color = "#e67e22"
+        action_tag, decision_text, decision_color = "watch", "觀察整理", "#e67e22"
     else:
-        action_tag = "reduce"
-        decision_text = "警示/建議減碼"
-        decision_color = "#d9383a"
-
-    is_overheat = (action_tag == "overheat")
-    is_bull = price > ma20
+        action_tag, decision_text, decision_color = "reduce", "警示/建議減碼", "#d9383a"
 
     # 策略計算
-    strategy = {}
-    if is_overheat:
-        strategy["type"] = "overheat"
-        strategy["tp"] = round(price * 1.05, 1)
-        strategy["ma20"] = round(ma20, 1)
+    s = {}
+    if action_tag == "overheat":
+        s = {"type": "overheat", "tp": round(price*1.05,1), "ma20": round(ma20,1)}
     else:
-        strategy["type"] = "normal"
+        s["type"] = "normal"
         if price > ma10:
-            strategy["short_entry_min"] = round(ma10, 1)
-            strategy["short_entry_max"] = round(ma10 * 1.01, 1)
-            strategy["short_tp"] = round(price * 1.05, 1)
-            strategy["short_sl"] = round(price - atr * 1.5, 1)
+            s.update({"short_entry_min": round(ma10,1), "short_entry_max": round(ma10*1.01,1),
+                       "short_tp": round(price*1.05,1), "short_sl": round(price-atr*1.5,1)})
         else:
-            strategy["short_no_entry"] = round(ma10, 1)
-
+            s["short_no_entry"] = round(ma10,1)
         if price > ma20:
-            strategy["swing_entry_min"] = round(ma20, 1)
-            strategy["swing_entry_max"] = round(ma20 * 1.015, 1)
-            swing_target = high_60d if high_60d > price else price * 1.15
-            strategy["swing_target"] = round(swing_target, 1)
-            strategy["swing_target_label"] = "前波高點" if high_60d > price else "估算目標(+15%)"
-            strategy["swing_sl"] = round(ma20 - atr * 1.5, 1)
+            tgt = high_60d if high_60d > price else price*1.15
+            s.update({"swing_entry_min": round(ma20,1), "swing_entry_max": round(ma20*1.015,1),
+                       "swing_target": round(tgt,1),
+                       "swing_target_label": "前波高點" if high_60d > price else "估算目標(+15%)",
+                       "swing_sl": round(ma20-atr*1.5,1)})
         elif price > ma60 and rsi >= 40:
-            strategy["swing_watch_ma60"] = round(ma60, 1)
-            strategy["swing_watch_ma20"] = round(ma20, 1)
+            s.update({"swing_watch_ma60": round(ma60,1), "swing_watch_ma20": round(ma20,1)})
         else:
-            strategy["swing_sl_below"] = round(price - atr * 1.5, 1)
-            strategy["swing_ma60"] = round(ma60, 1)
-
-        if action_tag in ("hold", "strong_buy"):
-            add_trigger = round(max(price, high_60d) * 1.005, 1)
-            vol_lots = round((avg_vol_20d * 1.5) / 1000) if avg_vol_20d else 0
-            strategy["add_trigger"] = add_trigger
-            strategy["vol_lots"] = vol_lots
-            strategy["reduce_trigger"] = round(ma20, 1)
+            s.update({"swing_sl_below": round(price-atr*1.5,1), "swing_ma60": round(ma60,1)})
+        if action_tag in ("hold","strong_buy"):
+            add_t = round(max(price,high_60d)*1.005,1)
+            lots  = round((avg_vol_20d*1.5)/1000) if avg_vol_20d else 0
+            s.update({"add_trigger": add_t, "vol_lots": lots, "reduce_trigger": round(ma20,1)})
 
     # 風險提醒
-    risk_lines = []
-    base_tips = {
-        "strong_buy": "🟢 多項指標同步轉強，技術結構健康，可依策略分批佈局。",
-        "hold": "🔵 趨勢仍在多頭軌道內，建議續抱觀察，留意加碼/減碼觸發價位。",
-        "overheat": "🟡 短線漲多乖離已大，建議暫緩追高，等待回測均線後再評估進場。",
-        "watch": "🟠 股價已跌破生命線但季線仍在守，屬整理區間，建議耐心觀察季線防守是否成立。",
-        "reduce": f"🔴 警告：{d['name']} 已實質跌破 20 日生命線與季線防守，技術面轉弱，任何反彈都屬弱勢整理，請嚴格執行停損紀律！",
-    }
-    risk_lines.append(base_tips.get(action_tag, ""))
-    if bias_pct > 10.0:
+    base = {"strong_buy":"🟢 多項指標同步轉強，技術結構健康，可依策略分批佈局。",
+            "hold":"🔵 趨勢仍在多頭軌道內，建議續抱觀察，留意加碼/減碼觸發價位。",
+            "overheat":"🟡 短線漲多乖離已大，建議暫緩追高，等待回測均線後再評估進場。",
+            "watch":"🟠 股價已跌破生命線但季線仍在守，屬整理區間，建議耐心觀察季線防守是否成立。",
+            "reduce":f"🔴 警告：{d['name']} 已實質跌破 20 日生命線與季線防守，技術面轉弱，請嚴格執行停損紀律！"}
+    risk_lines = [base[action_tag]]
+    if bias_pct > 10:
         risk_lines.append(f"⚠️ 正乖離過高 ({bias_pct:.1f}%)：隨時有向 20MA ({ma20:.1f}) 修正風險，切勿追高！")
-    elif bias_pct < -10.0:
+    elif bias_pct < -10:
         risk_lines.append(f"⚠️ 負乖離過大 ({bias_pct:.1f}%)：股價短線超跌，趨勢未明前勿貿然接刀。")
     if rsi > 70:
         risk_lines.append(f"⚠️ RSI 超買區 ({rsi:.1f})：買盤過熱，嚴防主力高檔反手出貨。")
     elif rsi < 30:
         risk_lines.append(f"⚠️ RSI 超賣區 ({rsi:.1f})：短線跌深，但趨勢未明，勿貿然接刀。")
-    if action_tag in ("strong_buy", "overheat") and v_ratio > 1.5:
+    if action_tag in ("strong_buy","overheat") and v_ratio > 1.5:
         risk_lines.append("🔥 短線波動劇烈，單筆資金請嚴格控制在 6-8%。")
     if action_tag == "reduce" and price < ma60:
         risk_lines.append(f"⚠️ 季線 ({ma60:.1f} 元) 已跌破，原防守位失效，請嚴格控管持股部位風險。")
 
-    # 今日漲跌幅
-    prev_close = d.get('prev_close', price)
-    day_chg = price - prev_close
-    day_chg_pct = (day_chg / prev_close * 100) if prev_close else 0.0
-
     # 股利顯示
-    latest_div = d.get('latest_div_cash') if d.get('latest_div_cash') is not None else d['div']
-    yield_rate = (latest_div / price * 100) if price > 0 else 0.0
-    div_display = f"{round(latest_div, 2):g}"
-    stk_display = f"{round(d['stk'], 2):g} 元" if d['stk'] > 0 else "-"
-    pe_display = f"{d['pe']:.1f} 倍" if d['pe'] and d['pe'] > 0 else "虧損/無"
-
-    # 外資期貨
-    futures_net = d.get('futures_net')
-    futures_date = d.get('futures_date', '')
+    div_cash = d["div_cash"]
+    yield_rate = round(div_cash/price*100, 2) if price > 0 else 0
+    day_chg = round(price - d["prev_close"], 2)
+    day_chg_pct = round(day_chg / d["prev_close"] * 100, 2) if d["prev_close"] else 0
 
     return jsonify({
-        "stock_no": stock_no,
-        "name": d['name'],
-        "price": d['price'],
-        "prev_close": prev_close,
-        "day_chg": round(day_chg, 2),
-        "day_chg_pct": round(day_chg_pct, 2),
-        "decision_text": decision_text,
-        "decision_color": decision_color,
-        "action_tag": action_tag,
-        "is_bull": is_bull,
-        "ma10": round(ma10, 1),
-        "ma20": round(ma20, 1),
-        "ma60": round(ma60, 1),
-        "bias_pct": round(bias_pct, 1),
-        "rsi": round(rsi, 1),
-        "v_ratio": round(v_ratio, 1),
-        "pattern": d['pattern'],
-        "div_display": div_display,
-        "stk_display": stk_display,
-        "yield_rate": round(yield_rate, 2),
-        "pe_display": pe_display,
-        "div_period": d.get('latest_div_period', ''),
-        "div_status": d.get('div_status', ''),
-        "is_latest_confirmed": d.get('is_latest_confirmed', False),
-        "futures_net": futures_net,
-        "futures_date": futures_date,
-        "strategy": strategy,
-        "risk_lines": risk_lines,
-        "is_etf": is_etf_code(stock_no),
+        "stock_no": stock_no, "name": d["name"],
+        "price": d["price"], "prev_close": d["prev_close"],
+        "day_chg": day_chg, "day_chg_pct": day_chg_pct,
+        "decision_text": decision_text, "decision_color": decision_color, "action_tag": action_tag,
+        "is_bull": price > ma20,
+        "ma10": round(ma10,1), "ma20": round(ma20,1), "ma60": round(ma60,1),
+        "bias_pct": round(bias_pct,1), "rsi": round(rsi,1), "v_ratio": round(v_ratio,1),
+        "pattern": d["pattern"],
+        "div_display": f"{round(div_cash,2):g}",
+        "stk_display": f"{round(d['div_stk'],2):g} 元" if d["div_stk"]>0 else "-",
+        "yield_rate": yield_rate,
+        "pe_display": f"{d['pe']:.1f} 倍" if d["pe"]>0 else "虧損/無",
+        "div_period": d["div_period"], "div_confirmed": d["div_confirmed"],
+        "futures_net": d["futures_net"], "futures_date": d["futures_date"],
+        "is_etf": d["is_etf"],
+        "strategy": s, "risk_lines": risk_lines,
     })
 
 if __name__ == "__main__":
